@@ -18,6 +18,7 @@ type UseTileCameraParams = {
   viewportHeight: number
   minZoom?: number
   maxZoom?: number
+  resetKey?: string | number
 }
 
 type PointerState = {
@@ -42,7 +43,8 @@ export function useTileCamera({
   viewportWidth,
   viewportHeight,
   minZoom = 0.05,
-  maxZoom = 4
+  maxZoom = 4,
+  resetKey
 }: UseTileCameraParams) {
   const [camera, setCamera] = useState<TileCamera>(DEFAULT_CAMERA)
   const pointerStateRef = useRef<PointerState>({
@@ -51,6 +53,7 @@ export function useTileCamera({
     lastY: 0
   })
   const isInitializedRef = useRef(false)
+  const lastResetKeyRef = useRef<string | number | undefined>(resetKey)
 
   const fitCamera = useMemo(
     () =>
@@ -65,7 +68,6 @@ export function useTileCamera({
 
   useEffect(() => {
     if (
-      isInitializedRef.current ||
       viewportWidth <= 0 ||
       viewportHeight <= 0 ||
       worldWidth <= 0 ||
@@ -74,9 +76,18 @@ export function useTileCamera({
       return
     }
 
-    setCamera(fitCamera)
-    isInitializedRef.current = true
-  }, [fitCamera, viewportHeight, viewportWidth, worldHeight, worldWidth])
+    if (!isInitializedRef.current) {
+      setCamera(fitCamera)
+      isInitializedRef.current = true
+      lastResetKeyRef.current = resetKey
+      return
+    }
+
+    if (resetKey !== lastResetKeyRef.current) {
+      setCamera(fitCamera)
+      lastResetKeyRef.current = resetKey
+    }
+  }, [fitCamera, resetKey, viewportHeight, viewportWidth, worldHeight, worldWidth])
 
   const fitToWorld = useCallback(() => {
     setCamera(fitCamera)

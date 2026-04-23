@@ -1,116 +1,58 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useMemo } from "react";
 
-import {
-  createTileGrid,
-  TILE_MAP_COLUMNS,
-  TILE_MAP_ROWS,
-  TILE_SIZE
-} from '@/entities/tile'
-import { useTileCamera } from '@/features/tile-camera'
+import { useTileCamera } from "@/features/tile-camera";
+import { useElementSize } from "@/shared/lib/react/useElementSize";
 
-import { TileMapRenderer } from '../lib/tile-map-renderer'
+import { getLevelForZoom } from "../lib/tile-pyramid";
+import { useTilePyramidManifest } from "../model/useTilePyramidManifest";
+import { useTileMapRenderer } from "../model/useTileMapRenderer";
 
-type Viewport = {
-  width: number
-  height: number
-}
-
-const INITIAL_VIEWPORT: Viewport = {
+const EMPTY_VIEWPORT = {
   width: 1,
-  height: 1
-}
+  height: 1,
+};
 
 export function TileMapViewer() {
-  const canvasRef = useRef<HTMLCanvasElement | null>(null)
-  const containerRef = useRef<HTMLDivElement | null>(null)
-  const rendererRef = useRef<TileMapRenderer | null>(null)
-  const [viewport, setViewport] = useState<Viewport>(INITIAL_VIEWPORT)
-
-  const tileGrid = useMemo(
-    () =>
-      createTileGrid({
-        columns: TILE_MAP_COLUMNS,
-        rows: TILE_MAP_ROWS,
-        tileSize: TILE_SIZE
-      }),
-    []
-  )
+  const { ref: containerRef, size: viewport } =
+    useElementSize<HTMLDivElement>();
+  const manifestState = useTilePyramidManifest();
+  const manifest = manifestState.manifest;
 
   const { camera, bind, fitToWorld } = useTileCamera({
-    worldWidth: tileGrid.worldWidth,
-    worldHeight: tileGrid.worldHeight,
+    worldWidth: manifest?.worldWidth ?? EMPTY_VIEWPORT.width,
+    worldHeight: manifest?.worldHeight ?? EMPTY_VIEWPORT.height,
     viewportWidth: viewport.width,
-    viewportHeight: viewport.height
-  })
+    viewportHeight: viewport.height,
+    resetKey: manifest
+      ? `${manifest.worldWidth}:${manifest.worldHeight}:${manifest.levels.length}`
+      : "empty",
+  });
 
-  useEffect(() => {
-    const canvas = canvasRef.current
-    if (!canvas) {
-      return
+  const activeLevel = useMemo(() => {
+    if (!manifest) {
+      return null;
     }
 
-    const renderer = new TileMapRenderer(canvas, tileGrid)
-    renderer.initialize()
-    rendererRef.current = renderer
+    return getLevelForZoom(manifest, camera.zoom);
+  }, [camera.zoom, manifest]);
 
-    return () => {
-      renderer.destroy()
-      rendererRef.current = null
-    }
-  }, [tileGrid])
-
-  useEffect(() => {
-    const container = containerRef.current
-    if (!container) {
-      return
-    }
-
-    const observer = new ResizeObserver(([entry]) => {
-      const nextViewport = {
-        width: entry.contentRect.width,
-        height: entry.contentRect.height
-      }
-
-      setViewport(nextViewport)
-
-      const devicePixelRatio = window.devicePixelRatio || 1
-      rendererRef.current?.resize(
-        nextViewport.width,
-        nextViewport.height,
-        devicePixelRatio
-      )
-    })
-
-    observer.observe(container)
-
-    return () => {
-      observer.disconnect()
-    }
-  }, [])
-
-  useEffect(() => {
-    if (!rendererRef.current) {
-      return
-    }
-
-    const devicePixelRatio = window.devicePixelRatio || 1
-
-    rendererRef.current.resize(
-      viewport.width,
-      viewport.height,
-      devicePixelRatio
-    )
-    rendererRef.current.render(camera)
-  }, [camera, viewport.height, viewport.width])
+  const { canvasRef } = useTileMapRenderer({
+    manifest,
+    camera,
+    viewportWidth: viewport.width,
+    viewportHeight: viewport.height,
+  });
 
   return (
     <div className="viewer-card">
       <div className="viewer-card__toolbar">
-        <div className="viewer-card__badge">Pure WebGL renderer</div>
-
         <div className="viewer-card__stats">
-          <span>{TILE_MAP_COLUMNS} × {TILE_MAP_ROWS}</span>
-          <span>tile size: {TILE_SIZE}px</span>
+          <span>
+            {manifest
+              ? `${manifest.baseColumns} x ${manifest.baseRows}`
+              : "tileset..."}
+          </span>
+          <span>{activeLevel ? `LOD z=${activeLevel.z}` : "LOD --"}</span>
           <span>zoom: {camera.zoom.toFixed(2)}x</span>
         </div>
 
@@ -124,18 +66,20 @@ export function TileMapViewer() {
       </div>
 
       <div ref={containerRef} className="viewer-card__canvas-shell">
-        <canvas
-          ref={canvasRef}
-          className="viewer-card__canvas"
-          {...bind}
-        />
-      </div>
+        {manifestState.status === "error" && (
+          <div className="viewer-card__overlay">
+            Не удалось загрузить tileset: {manifestState.error}
+          </div>
+        )}
 
-      <div className="viewer-card__footer">
-        <span>ЛКМ + drag — pan</span>
-        <span>Колесо мыши — zoom</span>
-        <span>Рендеринг всех 62 500 тайлов идет одним буфером</span>
+        {manifestState.status === "loading" && (
+          <div className="viewer-card__overlay">
+            Загрузка Landsat tileset...
+          </div>
+        )}
+
+        <canvas ref={canvasRef} className="viewer-card__canvas" {...bind} />
       </div>
     </div>
-  )
+  );
 }
