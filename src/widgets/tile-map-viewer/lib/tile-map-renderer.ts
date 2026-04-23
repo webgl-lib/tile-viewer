@@ -5,8 +5,11 @@ import { createProgram } from '@/shared/lib/webgl/create-program'
 import fragmentShaderSource from './shaders/tiles.frag?raw'
 import vertexShaderSource from './shaders/tile.vert?raw'
 import {
+  getLevelForZoom,
+  getVisibleTiles,
   getVisibleTilesForZoom,
   type TilePyramidManifest,
+  type TilePyramidLevel,
   type VisibleTile
 } from './tile-pyramid'
 
@@ -23,6 +26,7 @@ type RendererResources = {
     viewProjection: WebGLUniformLocation
     model: WebGLUniformLocation
     texCoordScale: WebGLUniformLocation
+    alpha: WebGLUniformLocation
   }
 }
 
@@ -34,6 +38,8 @@ type TileTextureRecord = {
 
 const MAX_CACHED_TEXTURES = 384
 const RAW_TILE_SIZE = 256
+const TARGET_LEVEL_PREFETCH_OVERSCAN = 2
+const LEVEL_CROSSFADE_DURATION_MS = 180
 
 export class TileMapRenderer {
   private readonly canvas: HTMLCanvasElement
@@ -43,6 +49,9 @@ export class TileMapRenderer {
   private viewportHeight = 1
   private lastCamera: TileCamera | null = null
   private activeLevelZ: number | null = null
+  private transitionFromLevelZ: number | null = null
+  private transitionToLevelZ: number | null = null
+  private transitionStartTime = 0
   private frameRequestId: number | null = null
   private readonly textureCache = new Map<string, TileTextureRecord>()
   private readonly quadModelMatrix = new Matrix4()
@@ -86,6 +95,7 @@ export class TileMapRenderer {
     const viewProjection = gl.getUniformLocation(program, 'u_ViewProjection')
     const model = gl.getUniformLocation(program, 'u_Model')
     const texCoordScale = gl.getUniformLocation(program, 'u_TexCoordScale')
+    const alpha = gl.getUniformLocation(program, 'u_Alpha')
 
     if (
       position < 0 ||
@@ -93,7 +103,8 @@ export class TileMapRenderer {
       !sampler ||
       !viewProjection ||
       !model ||
-      !texCoordScale
+      !texCoordScale ||
+      !alpha
     ) {
       throw new Error('Failed to resolve shader locations')
     }
@@ -128,7 +139,8 @@ export class TileMapRenderer {
         sampler,
         viewProjection,
         model,
-        texCoordScale
+        texCoordScale,
+        alpha
       }
     }
   }
@@ -180,15 +192,83 @@ export class TileMapRenderer {
     gl.clearColor(0.062, 0.09, 0.15, 1)
     gl.clear(gl.COLOR_BUFFER_BIT)
 
+    const now = performance.now()
+    const activeLevel = this.getActiveLevel(camera)
+    const targetLevel = getLevelForZoom(
+      this.manifest,
+      camera.zoom,
+      this.transitionToLevelZ ?? this.activeLevelZ ?? undefined
+    )
+
+    if (activeLevel.z === targetLevel.z) {
+      this.clearTransition()
+    } else if (this.transitionToLevelZ !== targetLevel.z) {
+      this.startTransition(activeLevel.z, targetLevel.z, now)
+    }
+
+    if (activeLevel.z !== targetLevel.z) {
+      const prefetchTiles = getVisibleTiles(
+        this.manifest,
+        targetLevel,
+        camera,
+        this.viewportWidth,
+        this.viewportHeight,
+        TARGET_LEVEL_PREFETCH_OVERSCAN
+      )
+
+        this.warmTiles(prefetchTiles.tiles)
+    }
+
     const visibleTiles = getVisibleTilesForZoom(
       this.manifest,
       camera,
       this.viewportWidth,
       this.viewportHeight,
-      this.activeLevelZ ?? undefined
+      targetLevel.z
     )
-    this.activeLevelZ = visibleTiles.level.z
-    this.drawTiles(visibleTiles.tiles, false)
+
+    const transitionProgress = this.getTransitionProgress(now)
+    const shouldBlendLevels =
+      activeLevel.z !== visibleTiles.level.z &&
+      this.transitionFromLevelZ === activeLevel.z &&
+      this.transitionToLevelZ === visibleTiles.level.z
+
+    if (activeLevel.z !== visibleTiles.level.z) {
+      const fallbackTiles = getVisibleTiles(
+        this.manifest,
+        activeLevel,
+        camera,
+        this.viewportWidth,
+        this.viewportHeight
+      )
+
+      this.drawTiles(fallbackTiles.tiles, true, 1)
+    }
+
+    const drawnTargetTiles = this.drawTiles(
+      visibleTiles.tiles,
+      false,
+      shouldBlendLevels ? transitionProgress : 1
+    )
+    const targetReadiness =
+      visibleTiles.tiles.length === 0
+        ? 1
+        : drawnTargetTiles / visibleTiles.tiles.length
+
+    if (
+      this.activeLevelZ === null ||
+      activeLevel.z === visibleTiles.level.z
+    ) {
+      this.activeLevelZ = visibleTiles.level.z
+    } else if (shouldBlendLevels && transitionProgress >= 1 && targetReadiness >= 1) {
+      this.activeLevelZ = visibleTiles.level.z
+      this.clearTransition()
+    }
+
+    if (shouldBlendLevels && transitionProgress < 1) {
+      this.requestRender()
+    }
+
     this.evictOverflowTextures()
   }
 
@@ -217,12 +297,15 @@ export class TileMapRenderer {
     this.resources = null
   }
 
-  private drawTiles(tiles: VisibleTile[], cachedOnly: boolean) {
+  private drawTiles(tiles: VisibleTile[], cachedOnly: boolean, alpha = 1) {
     if (!this.resources) {
-      return
+      return 0
     }
 
     const { gl, uniforms } = this.resources
+    let drawnTiles = 0
+
+    gl.uniform1f(uniforms.alpha, alpha)
 
     for (const tile of tiles) {
       const texture = cachedOnly
@@ -246,7 +329,58 @@ export class TileMapRenderer {
         tile.textureHeight / RAW_TILE_SIZE
       )
       gl.drawArrays(gl.TRIANGLES, 0, 6)
+      drawnTiles += 1
     }
+
+    return drawnTiles
+  }
+
+  private warmTiles(tiles: VisibleTile[]) {
+    for (const tile of tiles) {
+      this.getOrCreateTexture(tile.rawUrl)
+    }
+  }
+
+  private startTransition(fromLevelZ: number, toLevelZ: number, now: number) {
+    this.transitionFromLevelZ = fromLevelZ
+    this.transitionToLevelZ = toLevelZ
+    this.transitionStartTime = now
+  }
+
+  private clearTransition() {
+    this.transitionFromLevelZ = null
+    this.transitionToLevelZ = null
+    this.transitionStartTime = 0
+  }
+
+  private getTransitionProgress(now: number) {
+    if (this.transitionToLevelZ === null || this.transitionStartTime === 0) {
+      return 1
+    }
+
+    return Math.min(
+      Math.max((now - this.transitionStartTime) / LEVEL_CROSSFADE_DURATION_MS, 0),
+      1
+    )
+  }
+
+  private getActiveLevel(camera: TileCamera) {
+    if (this.activeLevelZ !== null) {
+      const currentLevel = this.findLevelByZ(this.activeLevelZ)
+
+      if (currentLevel) {
+        return currentLevel
+      }
+    }
+
+    const fallbackLevel = getLevelForZoom(this.manifest, camera.zoom)
+    this.activeLevelZ = fallbackLevel.z
+
+    return fallbackLevel
+  }
+
+  private findLevelByZ(z: number): TilePyramidLevel | null {
+    return this.manifest.levels.find((level) => level.z === z) ?? null
   }
 
   private getCachedTexture(url: string) {
