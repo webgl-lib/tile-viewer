@@ -17,6 +17,7 @@ type RendererResources = {
   gl: WebGLRenderingContext
   program: WebGLProgram
   vertexBuffer: WebGLBuffer
+  textureSupport: RawTextureSupport
   attributes: {
     position: number
     texCoord: number
@@ -27,23 +28,51 @@ type RendererResources = {
     model: WebGLUniformLocation
     texCoordScale: WebGLUniformLocation
     alpha: WebGLUniformLocation
+    contrastLow: WebGLUniformLocation
+    contrastHigh: WebGLUniformLocation
+    contrastGamma: WebGLUniformLocation
+    textureEncoding: WebGLUniformLocation
   }
+}
+
+export type TileContrastSettings = {
+  low: number
+  high: number
+  gamma: number
+}
+
+type FrameRenderedCallback = (time: number) => void
+
+type RawTextureEncoding = 'float' | 'packed-uint16'
+
+type RawTextureSupport = {
+  preferEncoding: RawTextureEncoding
+  floatLinear: boolean
 }
 
 type TileTextureRecord = {
   status: 'loading' | 'ready' | 'error'
   texture: WebGLTexture | null
-  rawData: Uint16Array | null
+  encoding: RawTextureEncoding | null
 }
 
 const MAX_CACHED_TEXTURES = 384
 const RAW_TILE_SIZE = 256
 const TARGET_LEVEL_PREFETCH_OVERSCAN = 2
 const LEVEL_CROSSFADE_DURATION_MS = 180
+const UINT16_MAX_VALUE = 65535
+const TEXTURE_ENCODING_FLOAT = 0
+const TEXTURE_ENCODING_PACKED_UINT16 = 1
+const DEFAULT_CONTRAST_SETTINGS: TileContrastSettings = {
+  low: 0,
+  high: 1,
+  gamma: 1
+}
 
 export class TileMapRenderer {
   private readonly canvas: HTMLCanvasElement
   private readonly manifest: TilePyramidManifest
+  private readonly onFrameRendered?: FrameRenderedCallback
   private resources: RendererResources | null = null
   private viewportWidth = 1
   private viewportHeight = 1
@@ -53,13 +82,19 @@ export class TileMapRenderer {
   private transitionToLevelZ: number | null = null
   private transitionStartTime = 0
   private frameRequestId: number | null = null
+  private contrastSettings = DEFAULT_CONTRAST_SETTINGS
   private readonly textureCache = new Map<string, TileTextureRecord>()
   private readonly quadModelMatrix = new Matrix4()
   private readonly quadScaleMatrix = new Matrix4()
 
-  constructor(canvas: HTMLCanvasElement, manifest: TilePyramidManifest) {
+  constructor(
+    canvas: HTMLCanvasElement,
+    manifest: TilePyramidManifest,
+    onFrameRendered?: FrameRenderedCallback
+  ) {
     this.canvas = canvas
     this.manifest = manifest
+    this.onFrameRendered = onFrameRendered
   }
 
   initialize() {
@@ -85,6 +120,7 @@ export class TileMapRenderer {
     gl.useProgram(program)
     gl.enable(gl.BLEND)
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
+    const textureSupport = resolveRawTextureSupport(gl)
 
     gl.bindBuffer(gl.ARRAY_BUFFER, vertexBuffer)
     gl.bufferData(gl.ARRAY_BUFFER, createQuadVertexData(), gl.STATIC_DRAW)
@@ -96,6 +132,10 @@ export class TileMapRenderer {
     const model = gl.getUniformLocation(program, 'u_Model')
     const texCoordScale = gl.getUniformLocation(program, 'u_TexCoordScale')
     const alpha = gl.getUniformLocation(program, 'u_Alpha')
+    const contrastLow = gl.getUniformLocation(program, 'u_ContrastLow')
+    const contrastHigh = gl.getUniformLocation(program, 'u_ContrastHigh')
+    const contrastGamma = gl.getUniformLocation(program, 'u_ContrastGamma')
+    const textureEncoding = gl.getUniformLocation(program, 'u_TextureEncoding')
 
     if (
       position < 0 ||
@@ -104,7 +144,11 @@ export class TileMapRenderer {
       !viewProjection ||
       !model ||
       !texCoordScale ||
-      !alpha
+      !alpha ||
+      !contrastLow ||
+      !contrastHigh ||
+      !contrastGamma ||
+      !textureEncoding
     ) {
       throw new Error('Failed to resolve shader locations')
     }
@@ -131,6 +175,7 @@ export class TileMapRenderer {
       gl,
       program,
       vertexBuffer,
+      textureSupport,
       attributes: {
         position,
         texCoord
@@ -140,7 +185,11 @@ export class TileMapRenderer {
         viewProjection,
         model,
         texCoordScale,
-        alpha
+        alpha,
+        contrastLow,
+        contrastHigh,
+        contrastGamma,
+        textureEncoding
       }
     }
   }
@@ -162,12 +211,13 @@ export class TileMapRenderer {
     this.resources.gl.viewport(0, 0, width, height)
   }
 
-  render(camera: TileCamera) {
+  render(camera: TileCamera, contrastSettings = DEFAULT_CONTRAST_SETTINGS) {
     if (!this.resources) {
       return
     }
 
     this.lastCamera = { ...camera }
+    this.contrastSettings = sanitizeContrastSettings(contrastSettings)
 
     const { gl, uniforms } = this.resources
 
@@ -188,6 +238,9 @@ export class TileMapRenderer {
       false,
       viewProjection.elements
     )
+    gl.uniform1f(uniforms.contrastLow, this.contrastSettings.low)
+    gl.uniform1f(uniforms.contrastHigh, this.contrastSettings.high)
+    gl.uniform1f(uniforms.contrastGamma, this.contrastSettings.gamma)
 
     gl.clearColor(0.062, 0.09, 0.15, 1)
     gl.clear(gl.COLOR_BUFFER_BIT)
@@ -270,6 +323,7 @@ export class TileMapRenderer {
     }
 
     this.evictOverflowTextures()
+    this.onFrameRendered?.(performance.now())
   }
 
   destroy() {
@@ -312,11 +366,17 @@ export class TileMapRenderer {
         ? this.getCachedTexture(tile.rawUrl)
         : this.getOrCreateTexture(tile.rawUrl)
 
-      if (!texture) {
+      if (!texture?.texture || !texture.encoding) {
         continue
       }
 
-      gl.bindTexture(gl.TEXTURE_2D, texture)
+      gl.uniform1i(
+        uniforms.textureEncoding,
+        texture.encoding === 'float'
+          ? TEXTURE_ENCODING_FLOAT
+          : TEXTURE_ENCODING_PACKED_UINT16
+      )
+      gl.bindTexture(gl.TEXTURE_2D, texture.texture)
 
       const model = this.quadModelMatrix
         .setTranslate(tile.worldX, tile.worldY, 0)
@@ -383,7 +443,7 @@ export class TileMapRenderer {
     return this.manifest.levels.find((level) => level.z === z) ?? null
   }
 
-  private getCachedTexture(url: string) {
+  private getCachedTexture(url: string): TileTextureRecord | null {
     const cached = this.textureCache.get(url)
 
     if (cached?.status !== 'ready') {
@@ -393,10 +453,10 @@ export class TileMapRenderer {
     this.textureCache.delete(url)
     this.textureCache.set(url, cached)
 
-    return cached.texture
+    return cached
   }
 
-  private getOrCreateTexture(url: string) {
+  private getOrCreateTexture(url: string): TileTextureRecord | null {
     if (!this.resources) {
       return null
     }
@@ -406,7 +466,7 @@ export class TileMapRenderer {
     if (cached?.status === 'ready') {
       this.textureCache.delete(url)
       this.textureCache.set(url, cached)
-      return cached.texture
+      return cached
     }
 
     if (cached) {
@@ -416,7 +476,7 @@ export class TileMapRenderer {
     this.textureCache.set(url, {
       status: 'loading',
       texture: null,
-      rawData: null
+      encoding: null
     })
 
     void fetch(url)
@@ -436,13 +496,14 @@ export class TileMapRenderer {
         const texture = createTextureFromRawTile(
           this.resources.gl,
           rawData,
-          RAW_TILE_SIZE
+          RAW_TILE_SIZE,
+          this.resources.textureSupport
         )
 
         this.textureCache.set(url, {
           status: texture ? 'ready' : 'error',
-          texture,
-          rawData
+          texture: texture?.texture ?? null,
+          encoding: texture?.encoding ?? null
         })
         this.requestRender()
       })
@@ -450,7 +511,7 @@ export class TileMapRenderer {
         this.textureCache.set(url, {
           status: 'error',
           texture: null,
-          rawData: null
+          encoding: null
         })
       })
 
@@ -466,7 +527,7 @@ export class TileMapRenderer {
       this.frameRequestId = null
 
       if (this.lastCamera) {
-        this.render(this.lastCamera)
+        this.render(this.lastCamera, this.contrastSettings)
       }
     })
   }
@@ -505,11 +566,11 @@ function createQuadVertexData() {
   ])
 }
 
-function createTextureFromImage(
+function createFloatTextureFromRawTile(
   gl: WebGLRenderingContext,
-  imageData: Uint8Array,
-  width: number,
-  height: number
+  rawData: Uint16Array,
+  tileSize: number,
+  useLinearFiltering: boolean
 ) {
   const texture = gl.createTexture()
 
@@ -517,22 +578,78 @@ function createTextureFromImage(
     return null
   }
 
+  const normalizedData = new Float32Array(tileSize * tileSize)
+
+  for (let index = 0; index < rawData.length; index += 1) {
+    normalizedData[index] = rawData[index] / UINT16_MAX_VALUE
+  }
+
   gl.bindTexture(gl.TEXTURE_2D, texture)
-  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 1)
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+  gl.texParameteri(
+    gl.TEXTURE_2D,
+    gl.TEXTURE_MIN_FILTER,
+    useLinearFiltering ? gl.LINEAR : gl.NEAREST
+  )
+  gl.texParameteri(
+    gl.TEXTURE_2D,
+    gl.TEXTURE_MAG_FILTER,
+    useLinearFiltering ? gl.LINEAR : gl.NEAREST
+  )
+  gl.texImage2D(
+    gl.TEXTURE_2D,
+    0,
+    gl.LUMINANCE,
+    tileSize,
+    tileSize,
+    0,
+    gl.LUMINANCE,
+    gl.FLOAT,
+    normalizedData
+  )
+
+  return texture
+}
+
+function createPackedUint16TextureFromRawTile(
+  gl: WebGLRenderingContext,
+  rawData: Uint16Array,
+  tileSize: number
+) {
+  const texture = gl.createTexture()
+
+  if (!texture) {
+    return null
+  }
+
+  const packedData = new Uint8Array(tileSize * tileSize * 4)
+
+  for (let index = 0; index < rawData.length; index += 1) {
+    const value = rawData[index]
+    const rgbaIndex = index * 4
+
+    packedData[rgbaIndex] = value >> 8
+    packedData[rgbaIndex + 1] = value & 255
+    packedData[rgbaIndex + 2] = 0
+    packedData[rgbaIndex + 3] = 255
+  }
+
+  gl.bindTexture(gl.TEXTURE_2D, texture)
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
   gl.texImage2D(
     gl.TEXTURE_2D,
     0,
     gl.RGBA,
-    width,
-    height,
+    tileSize,
+    tileSize,
     0,
     gl.RGBA,
     gl.UNSIGNED_BYTE,
-    imageData
+    packedData
   )
 
   return texture
@@ -541,36 +658,60 @@ function createTextureFromImage(
 function createTextureFromRawTile(
   gl: WebGLRenderingContext,
   rawData: Uint16Array,
-  tileSize: number
+  tileSize: number,
+  textureSupport: RawTextureSupport
 ) {
-  const rgbaData = normalizeRawTileToRgba(rawData, tileSize)
+  if (textureSupport.preferEncoding === 'float') {
+    const texture = createFloatTextureFromRawTile(
+      gl,
+      rawData,
+      tileSize,
+      textureSupport.floatLinear
+    )
 
-  return createTextureFromImage(gl, rgbaData, tileSize, tileSize)
-}
-
-function normalizeRawTileToRgba(rawData: Uint16Array, tileSize: number) {
-  const rgbaData = new Uint8Array(tileSize * tileSize * 4)
-  let maxValue = 0
-
-  for (let index = 0; index < rawData.length; index += 1) {
-    if (rawData[index] > maxValue) {
-      maxValue = rawData[index]
+    if (texture) {
+      return {
+        texture,
+        encoding: 'float' as const
+      }
     }
   }
 
-  const safeMax = Math.max(maxValue, 1)
+  const texture = createPackedUint16TextureFromRawTile(gl, rawData, tileSize)
 
-  for (let index = 0; index < rawData.length; index += 1) {
-    const value = rawData[index]
-    const rgbaIndex = index * 4
-
-    const normalizedValue = Math.round((value / safeMax) * 255)
-
-    rgbaData[rgbaIndex] = normalizedValue
-    rgbaData[rgbaIndex + 1] = normalizedValue
-    rgbaData[rgbaIndex + 2] = normalizedValue
-    rgbaData[rgbaIndex + 3] = 255
+  if (!texture) {
+    return null
   }
 
-  return rgbaData
+  return {
+    texture,
+    encoding: 'packed-uint16' as const
+  }
+}
+
+function resolveRawTextureSupport(gl: WebGLRenderingContext): RawTextureSupport {
+  const floatTextures = gl.getExtension('OES_texture_float')
+  const floatLinear = Boolean(gl.getExtension('OES_texture_float_linear'))
+
+  return {
+    preferEncoding: floatTextures ? 'float' : 'packed-uint16',
+    floatLinear
+  }
+}
+
+function sanitizeContrastSettings(
+  settings: TileContrastSettings
+): TileContrastSettings {
+  const low = clamp01(settings.low)
+  const high = Math.max(clamp01(settings.high), low + 0.00001)
+
+  return {
+    low,
+    high,
+    gamma: Math.max(settings.gamma, 0.00001)
+  }
+}
+
+function clamp01(value: number) {
+  return Math.max(0, Math.min(1, value))
 }

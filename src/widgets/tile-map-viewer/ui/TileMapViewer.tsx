@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 
 import { useTileCamera } from "@/features/tile-camera";
 import { useElementSize } from "@/shared/lib/react/useElementSize";
@@ -13,6 +13,11 @@ const EMPTY_VIEWPORT = {
 };
 
 export function TileMapViewer() {
+  const [contrastSettings, setContrastSettings] = useState({
+    low: 0,
+    high: 1,
+    gamma: 1,
+  });
   const { ref: containerRef, size: viewport } =
     useElementSize<HTMLDivElement>();
   const manifestState = useTilePyramidManifest();
@@ -36,12 +41,35 @@ export function TileMapViewer() {
     return getLevelForZoom(manifest, camera.zoom);
   }, [camera.zoom, manifest]);
 
-  const { canvasRef } = useTileMapRenderer({
+  const { canvasRef, fps } = useTileMapRenderer({
     manifest,
     camera,
+    contrastSettings,
     viewportWidth: viewport.width,
     viewportHeight: viewport.height,
   });
+
+  const updateContrastSetting = (
+    key: keyof typeof contrastSettings,
+    value: number
+  ) => {
+    setContrastSettings((current) => {
+      const next = {
+        ...current,
+        [key]: value,
+      };
+
+      if (key === "low" && next.low >= next.high) {
+        next.high = Math.min(next.low + 0.01, 1);
+      }
+
+      if (key === "high" && next.high <= next.low) {
+        next.low = Math.max(next.high - 0.01, 0);
+      }
+
+      return next;
+    });
+  };
 
   return (
     <div className="viewer-card">
@@ -54,6 +82,7 @@ export function TileMapViewer() {
           </span>
           <span>{activeLevel ? `LOD z=${activeLevel.z}` : "LOD --"}</span>
           <span>zoom: {camera.zoom.toFixed(2)}x</span>
+          <span>fps: {fps || "--"}</span>
         </div>
 
         <button
@@ -63,6 +92,50 @@ export function TileMapViewer() {
         >
           Fit to view
         </button>
+      </div>
+
+      <div className="viewer-card__contrast-panel">
+        <label className="viewer-card__slider">
+          <span>low {contrastSettings.low.toFixed(2)}</span>
+          <input
+            type="range"
+            min="0"
+            max="1"
+            step="0.005"
+            value={contrastSettings.low}
+            onChange={(event) =>
+              updateContrastSetting("low", Number(event.target.value))
+            }
+          />
+        </label>
+
+        <label className="viewer-card__slider">
+          <span>high {contrastSettings.high.toFixed(2)}</span>
+          <input
+            type="range"
+            min="0"
+            max="1"
+            step="0.005"
+            value={contrastSettings.high}
+            onChange={(event) =>
+              updateContrastSetting("high", Number(event.target.value))
+            }
+          />
+        </label>
+
+        <label className="viewer-card__slider">
+          <span>gamma {contrastSettings.gamma.toFixed(2)}</span>
+          <input
+            type="range"
+            min="0.2"
+            max="4"
+            step="0.01"
+            value={contrastSettings.gamma}
+            onChange={(event) =>
+              updateContrastSetting("gamma", Number(event.target.value))
+            }
+          />
+        </label>
       </div>
 
       <div ref={containerRef} className="viewer-card__canvas-shell">

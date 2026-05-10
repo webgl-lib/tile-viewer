@@ -52,6 +52,7 @@ a {
 
 .viewer-card {
   display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
   gap: 12px;
   height: 100%;
   border: 1px solid rgba(173, 189, 227, 0.18);
@@ -94,6 +95,26 @@ a {
   opacity: 0.94;
 }
 
+.viewer-card__contrast-panel {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(160px, 1fr));
+  gap: 12px;
+  align-items: end;
+}
+
+.viewer-card__slider {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  color: #c6d3e6;
+  font-size: 13px;
+}
+
+.viewer-card__slider input {
+  width: 100%;
+  accent-color: #64d2ff;
+}
+
 .viewer-card__canvas-shell {
   position: relative;
   min-height: 0;
@@ -134,5 +155,9 @@ a {
 @media (max-width: 960px) {
   .page {
     padding: 12px;
+  }
+
+  .viewer-card__contrast-panel {
+    grid-template-columns: 1fr;
   }
 }
